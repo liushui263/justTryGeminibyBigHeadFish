@@ -1,28 +1,21 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
-#include <string>
-#include <chrono>
+#include <fstream>
 #include <iomanip>
-#include <algorithm>
+#include <algorithm> // <--- 之前缺失的关键头文件 (用于 std::min_element)
+#include <iterator>  // 用于 std::distance
 #include "physics_utils.h"
 #include "assembler.h"
 #include "solver.h"
 #include "analytical.h"
 #include "exporter.h"
+#include "config_types.h" 
 
-// 简单的 NaN 检查工具
-bool has_nan(const std::vector<cuComplexType>& vec, std::string name) {
-    for (size_t i = 0; i < vec.size(); ++i) {
-        if (std::isnan(vec[i].x) || std::isnan(vec[i].y)) {
-            std::cerr << "[ERROR] " << name << " contains NaN at index " << i << "!" << std::endl;
-            return true;
-        }
-    }
-    return false;
-}
+// 声明解析函数 (在 config_loader.cpp 中实现)
+SimulationConfig load_config(const std::string& filename);
 
-// 非均匀网格生成器
+// --- 辅助：网格生成 ---
 std::vector<double> generate_stretched_coords(int n, double dx_min, double stretch_ratio) {
     std::vector<double> coords(n + 1);
     int center_idx = n / 2;
@@ -44,29 +37,88 @@ std::vector<double> generate_stretched_coords(int n, double dx_min, double stret
     return coords;
 }
 
-void print_grid_stats(const std::vector<double>& nodes, const std::string& name) {
-    double total_len = nodes.back() - nodes.front();
-    double min_dx = 1e9, max_dx = 0;
-    for(size_t i=0; i<nodes.size()-1; ++i) {
-        double d = nodes[i+1] - nodes[i];
-        if(d < min_dx) min_dx = d;
-        if(d > max_dx) max_dx = d;
-    }
-    std::cout << "  [" << name << "] Radius: " << total_len/2.0 << "m (Total: " << total_len << "m)" << std::endl;
-    std::cout << "             Min dx: " << min_dx << "m (Center)" << std::endl;
-    std::cout << "             Max dx: " << max_dx << "m (Boundary)" << std::endl;
+// --- 辅助：寻找最近网格点 ---
+int find_nearest_node(const std::vector<double>& nodes, double val) {
+    auto it = std::min_element(nodes.begin(), nodes.end(), 
+        [val](double a, double b) { return std::abs(a - val) < std::abs(b - val); });
+    return std::distance(nodes.begin(), it);
 }
 
-// 适配非均匀网格的材料计算
-std::vector<MaterialProperty> compute_materials_nonuniform(
-    const GridInfo& grid, double omega, double rho_bg, int n_pml
+// --- 核心：通用源施加 ---
+void apply_source_generic(
+    const SourceConfig& src, 
+    const GridInfo& grid, 
+    std::vector<cuComplexType>& rhs
 ) {
+    // 1. 找到源在网格中的索引
+    int ix = find_nearest_node(grid.x_nodes, src.position[0]);
+    int iy = find_nearest_node(grid.y_nodes, src.position[1]);
+    int iz = find_nearest_node(grid.z_nodes, src.position[2]);
+    
+    // 边界保护
+    if (ix >= grid.nx) ix = grid.nx-1; 
+    if (iy >= grid.ny) iy = grid.ny-1; 
+    if (iz >= grid.nz) iz = grid.nz-1;
+
+    double amp = src.amplitude;
+    double nx = src.direction[0];
+    double ny = src.direction[1];
+    double nz = src.direction[2];
+
+    auto add_rhs = [&](int i, int j, int k, int comp, double val) {
+        long long idx = (long long)comp * grid.nx * grid.ny * grid.nz 
+                        + (long long)k * grid.nx * grid.ny 
+                        + (long long)j * grid.nx + i;
+        if(idx < (long long)rhs.size()) rhs[idx].x += (float)val;
+    };
+
+    if (src.type == "magnetic_dipole") {
+        // 磁偶极子 M (电流环)
+        // M_z (在 XY 平面上的环)
+        if (std::abs(nz) > 1e-6) {
+            double mz = amp * nz;
+            add_rhs(ix, iy, iz, 0, -mz);    // Ex(y_bot)
+            add_rhs(ix, iy+1, iz, 0, mz);   // Ex(y_top)
+            add_rhs(ix, iy, iz, 1, mz);     // Ey(x_left)
+            add_rhs(ix+1, iy, iz, 1, -mz);  // Ey(x_right)
+        }
+        // M_x (在 YZ 平面上的环)
+        if (std::abs(nx) > 1e-6) {
+            double mx = amp * nx;
+            add_rhs(ix, iy, iz, 1, -mx);    // Ey(z_bot)
+            add_rhs(ix, iy, iz+1, 1, mx);   // Ey(z_top)
+            add_rhs(ix, iy, iz, 2, mx);     // Ez(y_left)
+            add_rhs(ix, iy+1, iz, 2, -mx);  // Ez(y_right)
+        }
+        // M_y (在 XZ 平面上的环)
+        if (std::abs(ny) > 1e-6) {
+            double my = amp * ny;
+            add_rhs(ix, iy, iz, 2, -my);    // Ez(x_left)
+            add_rhs(ix+1, iy, iz, 2, my);   // Ez(x_right)
+            add_rhs(ix, iy, iz, 0, my);     // Ex(z_bot)
+            add_rhs(ix, iy, iz+1, 0, -my);  // Ex(z_top)
+        }
+    } else if (src.type == "electric_dipole") {
+        // 电偶极子 J (直接加在边上)
+        // 注意：这里做最简单的最近邻插值。更精确的做法是将 J 分配到周围的边上。
+        if (std::abs(nx) > 1e-6) add_rhs(ix, iy, iz, 0, amp * nx);
+        if (std::abs(ny) > 1e-6) add_rhs(ix, iy, iz, 1, amp * ny);
+        if (std::abs(nz) > 1e-6) add_rhs(ix, iy, iz, 2, amp * nz);
+    }
+}
+
+// --- 材料生成 (支持简单模型) ---
+std::vector<MaterialProperty> generate_materials(const SimulationConfig& cfg, const GridInfo& grid, double omega) {
     long long total_cells = (long long)grid.nx * grid.ny * grid.nz;
     std::vector<MaterialProperty> materials(total_cells);
-    double sigma_bg = 1.0 / rho_bg;
     
-    // 对于 500Hz，波长极长，PML 导电率需要设置得更强一些
+    // 默认简单模型
+    double rho = cfg.model.bg_rho;
+    double sigma_bg = 1.0 / rho;
+    
+    // 自动调节 PML 强度: 频率越低(波长越长)，需要的 PML 越强
     double sigma_pml_max = sigma_bg * 50.0; 
+    int n_pml = cfg.model.pml_layers;
 
     #pragma omp parallel for
     for (int idx = 0; idx < total_cells; ++idx) {
@@ -80,124 +132,95 @@ std::vector<MaterialProperty> compute_materials_nonuniform(
         float mu_inv = 1.0f / (4.0f * M_PI * 1e-7f);
         mat.mu_inv_eff.set_isotropic({mu_inv, 0.0f});
 
-        double pml_x = 0, pml_y = 0, pml_z = 0;
-        
-        // 基于网格索引添加 PML (简单且鲁棒)
-        auto calc_pml = [&](int idx, int max_idx) {
-            if (idx < n_pml) {
-                double r = (double)(n_pml - idx) / n_pml;
-                return sigma_pml_max * r * r * r;
-            } else if (idx >= max_idx - n_pml) {
-                double r = (double)(idx - (max_idx - n_pml - 1)) / n_pml;
-                return sigma_pml_max * r * r * r;
-            }
+        // PML Logic (Simplified Index Based)
+        auto get_pml = [&](int idx, int max) {
+            if(idx < n_pml) return sigma_pml_max * std::pow((double)(n_pml-idx)/n_pml, 3);
+            if(idx >= max-n_pml) return sigma_pml_max * std::pow((double)(idx-(max-n_pml-1))/n_pml, 3);
             return 0.0;
         };
-
-        pml_x = calc_pml(i, grid.nx);
-        pml_y = calc_pml(j, grid.ny);
-        pml_z = calc_pml(k, grid.nz);
-
-        double total_pml = pml_x + pml_y + pml_z;
+        double px = get_pml(i, grid.nx);
+        double py = get_pml(j, grid.ny);
+        double pz = get_pml(k, grid.nz);
+        
+        double total_pml = px + py + pz;
         if (total_pml > 0) {
-            Complex current = mat.sigma_eff.val[0];
-            mat.sigma_eff.set_isotropic({current.real() + (float)total_pml, current.imag()});
+            Complex c = mat.sigma_eff.val[0];
+            mat.sigma_eff.set_isotropic({c.real() + (float)total_pml, c.imag()});
         }
         materials[idx] = mat;
     }
     return materials;
 }
 
-void run_simulation_case(const std::string& case_name, const GridInfo& grid, 
-                        const std::vector<MaterialProperty>& materials, double omega) {
-    std::cout << "\n>>> Running Case: " << case_name << " <<<" << std::endl;
+int main(int argc, char** argv) {
+    std::string config_file = "test_500hz.json"; // 默认输入文件
+    if (argc > 1) config_file = argv[1];
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    // 使用 Direct Non-Uniform 方法 (use_coord_xform = false)
-    Assembler assembler(grid, omega, false);
+    std::cout << "=== Universal LWD Solver (BigHeadFish) ===" << std::endl;
+    std::cout << "Loading config: " << config_file << std::endl;
+
+    // 1. 加载配置
+    SimulationConfig cfg = load_config(config_file);
+
+    // 2. 生成网格
+    GridInfo grid;
+    grid.nx = cfg.grid.nx; grid.ny = cfg.grid.ny; grid.nz = cfg.grid.nz;
+    grid.x_nodes = generate_stretched_coords(grid.nx, cfg.grid.dx_min, cfg.grid.stretch_ratio);
+    grid.y_nodes = generate_stretched_coords(grid.ny, cfg.grid.dx_min, cfg.grid.stretch_ratio);
+    grid.z_nodes = generate_stretched_coords(grid.nz, cfg.grid.dx_min, cfg.grid.stretch_ratio);
+
+    std::cout << "Grid: " << grid.nx << "x" << grid.ny << "x" << grid.nz 
+              << " (Min dx=" << cfg.grid.dx_min << ")" << std::endl;
+
+    // 3. 准备物理参数
+    double omega = 2.0 * M_PI * cfg.source.frequency;
+    auto materials = generate_materials(cfg, grid, omega);
+
+    // 4. 组装矩阵
+    std::cout << "Assembling Matrix..." << std::endl;
+    Assembler assembler(grid, omega, false); // Default direct method
     CsrMatrix A = assembler.assemble_system_matrix(materials);
-    std::cout << "    Matrix Assembled. NNZ: " << A.nnz << std::endl;
+    std::cout << "NNZ: " << A.nnz << std::endl;
 
-    if (has_nan(A.val, "Matrix A")) return;
-
+    // 5. 施加源
     std::vector<cuComplexType> rhs(A.num_rows, {0.0f, 0.0f});
-    int cx = grid.nx / 2;
-    int cy = grid.ny / 2;
-    int cz = grid.nz / 2;
-    
-    // Mz Source Loop
-    auto add_edge = [&](int i, int j, int k, int comp, double val) {
-        long long idx = (long long)comp * grid.nx * grid.ny * grid.nz 
-                        + (long long)k * grid.nx * grid.ny 
-                        + (long long)j * grid.nx + i;
-        if(idx < (long long)rhs.size()) rhs[idx].x += (float)val;
-    };
-    
-    double mz = 1.0;
-    add_edge(cx, cy, cz, 0, -mz);    
-    add_edge(cx, cy+1, cz, 0, mz);   
-    add_edge(cx, cy, cz, 1, mz);     
-    add_edge(cx+1, cy, cz, 1, -mz);  
+    apply_source_generic(cfg.source, grid, rhs);
 
+    // 6. 求解
+    std::cout << "Solving..." << std::endl;
     std::vector<cuComplexType> x;
     Solver solver;
     try {
         solver.solve(A, rhs, x);
+        std::cout << "Solved." << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "Solver failed: " << e.what() << std::endl;
-        return;
+        std::cerr << "Solver Failed: " << e.what() << std::endl;
+        return 1;
     }
+
+    // 7. 输出
+    if (cfg.receiver.type == "full_grid") {
+        std::string vtk_name = cfg.receiver.output_file + ".vtr";
+        VtkExporter::save_to_vtr(vtk_name, grid, x);
+        std::cout << "Full field saved to " << vtk_name << std::endl;
+    } 
     
-    if (has_nan(x, "Solution X")) {
-        std::cout << "    [FAILURE] Solver produced NaNs (Frequency might be too low for float)." << std::endl;
-    } else {
-        std::cout << "    [SUCCESS] Solver result valid." << std::endl;
+    // 8. 验证
+    if (cfg.validation.enabled && cfg.validation.mode == "analytical") {
+        std::cout << "[Validation] Comparing with Analytical Solution..." << std::endl;
+        // 计算源中心索引 (近似)
+        int ix = find_nearest_node(grid.x_nodes, cfg.source.position[0]);
+        int iy = find_nearest_node(grid.y_nodes, cfg.source.position[1]);
+        int iz = find_nearest_node(grid.z_nodes, cfg.source.position[2]);
         
-        // 简单输出中心附近的场值，确认不是全 0
-        int center_idx = get_dof_lebedev(grid, cx+5, cy, cz, SubGrid::G000, 1); // Offset 5
-        float val = std::sqrt(x[center_idx].x*x[center_idx].x + x[center_idx].y*x[center_idx].y);
-        std::cout << "    Check Val (Offset 5): " << val << std::endl;
+        auto exact = AnalyticalSolution::compute_field(
+            1.0/cfg.model.bg_rho, cfg.source.frequency, grid, 
+            ix+0.5, iy+0.5, iz+0.5, 
+            cfg.source.direction[0], cfg.source.direction[1], cfg.source.direction[2]
+        );
+        VtkExporter::save_to_vtr(cfg.receiver.output_file + "_analytical.vtr", grid, exact);
+        std::cout << "Analytical solution saved to " << cfg.receiver.output_file + "_analytical.vtr" << std::endl;
     }
-
-    auto t2 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-    std::cout << "    Solved in " << ms << " ms." << std::endl;
-
-    std::string filename = case_name + ".vtr";
-    VtkExporter::save_to_vtr(filename, grid, x);
-    std::cout << "    Result saved to " << filename << std::endl;
-}
-
-int main() {
-    std::cout << "=== LWD Low Frequency Challenge (500 Hz) ===" << std::endl;
-    
-    // --- 目标参数 ---
-    double freq = 500.0; 
-    double omega = 2.0 * M_PI * freq;
-    double rho = 20.0; 
-    
-    // --- 网格设置 ---
-    // 增加一点网格数来覆盖更大的区域，同时保持中心细腻
-    // 60x60x60 约 65万 单元，QR 分解还能扛得住
-    int n_grid = 60;        
-    double dx_min = 0.05;   // 中心 5cm
-    double ratio = 1.15;    // 增长率 15% (拉伸得更快，以捕捉 500Hz 的超长波长)
-
-    GridInfo grid;
-    grid.nx = n_grid; grid.ny = n_grid; grid.nz = n_grid;
-    grid.x_nodes = generate_stretched_coords(grid.nx, dx_min, ratio);
-    grid.y_nodes = generate_stretched_coords(grid.ny, dx_min, ratio);
-    grid.z_nodes = generate_stretched_coords(grid.nz, dx_min, ratio);
-
-    print_grid_stats(grid.x_nodes, "Grid Info");
-    // 预期半径应该在 100m - 200m 级别
-    
-    std::cout << "Generating Material Properties..." << std::endl;
-    // 增加 PML 层数到 8，保证低频吸收
-    auto materials = compute_materials_nonuniform(grid, omega, rho, 8);
-
-    // 调用仿真
-    run_simulation_case("Final_500Hz_Run", grid, materials, omega);
 
     return 0;
 }
