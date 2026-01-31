@@ -1,0 +1,51 @@
+{
+  "case_name": "LWD_Case3_EarthStar_Benchmark",
+  "grid": {
+    "nx": 90,
+    "ny": 90,
+    "nz": 90,
+    "dx_min": 0.05,
+    "stretch_ratio": 1.12
+  },
+  "source": {
+    "type": "magnetic_dipole",
+    "frequency": 2000.0,
+    "position": [0.0, 0.0, 0.0],
+    "direction": [1.0, 0.0, 0.0],
+    "amplitude": 1.0,
+    "note": "Transverse coil (X-coil) for azimuthal sensitivity"
+  },
+  "model": {
+    "type": "layered_tti",
+    "pml_layers": 8,
+    "layers": [
+      {
+        "name": "Oil_Sand",
+        "z_bottom": 15.0,
+        "rho_h": 50.0,
+        "rho_v": 100.0,
+        "dip": 5.0,
+        "azimuth": 0.0
+      },
+      {
+        "name": "Water_Leg",
+        "z_bottom": 9999.0,
+        "rho_h": 1.0,
+        "rho_v": 2.0,
+        "dip": 5.0,
+        "azimuth": 0.0
+      }
+    ]
+  },
+  "receiver": {
+    "type": "point_list",
+    "points": [
+       [30.0, 0.0, 0.0] 
+    ],
+    "note": "Receiver at 100 ft (approx 30m) offset",
+    "output_file": "output_case3_earthstar"
+  },
+  "validation": {
+    "enabled": false
+  }
+}

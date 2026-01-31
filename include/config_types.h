@@ -1,55 +1,43 @@
 #pragma once
-#include <string>
 #include <vector>
-#include <array>
+#include <string>
+#include <nlohmann/json.hpp>
 
-// 1. 源配置
+using json = nlohmann::json;
+
 struct SourceConfig {
-    std::string type; // "electric_dipole" or "magnetic_dipole"
-    double frequency;
-    std::array<double, 3> position; // [x, y, z] (m)
-    std::array<double, 3> direction; // [nx, ny, nz] (Normalized)
-    double amplitude;
+    std::string type;
+    double frequency = 0.0;
+    std::vector<double> position = {0.0, 0.0, 0.0};
+    std::vector<double> direction = {0.0, 0.0, 1.0};
+    double amplitude = 1.0;
 };
 
-// 2. 接收器配置
-struct ReceiverConfig {
-    std::string type; // "full_grid" or "point_list"
-    std::vector<std::array<double, 3>> points; // Only used if "point_list"
-    std::string output_file;
-};
-
-// 3. 模型配置
-struct ModelConfig {
-    std::string type; // "homogeneous" or "voxel"
-    // For homogeneous
-    double bg_rho; 
-    double anisotropy; // rho_v / rho_h
-    // For voxel (future expansion)
-    std::string voxel_file;
-    int pml_layers;
-};
-
-// 4. 网格配置
 struct GridConfig {
-    int nx, ny, nz;
-    double dx_min; // Center spacing
-    double stretch_ratio; // For non-uniform
+    int nx = 64, ny = 64, nz = 64;
+    double dx_min = 0.5;
+    double stretch_ratio = 1.1;
 };
 
-// 5. 验证配置
+struct ModelConfig {
+    double bg_rho = 1.0;
+    int pml_layers = 8;
+};
+
+struct ReceiverConfig {
+    std::string type = "full_grid";
+    std::string output_file = "output";
+};
+
 struct ValidationConfig {
-    bool enabled;
-    std::string mode; // "analytical" or "file"
-    std::string compare_file;
+    bool enabled = false;
+    std::string mode = "analytical";
 };
 
-// 总配置
 struct SimulationConfig {
-    std::string case_name;
-    SourceConfig source;
-    ReceiverConfig receiver;
-    ModelConfig model;
     GridConfig grid;
+    SourceConfig source;
+    ModelConfig model;
+    ReceiverConfig receiver;
     ValidationConfig validation;
 };

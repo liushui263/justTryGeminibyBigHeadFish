@@ -8,6 +8,7 @@ public:
     Assembler(const GridInfo& grid, double omega, bool use_coord_xform = false);
 
     CsrMatrix assemble_system_matrix(const std::vector<MaterialProperty>& materials);
+    CsrMatrix assemble_system_matrix_(const std::vector<MaterialProperty>& materials);
 
 private:
     GridInfo grid;

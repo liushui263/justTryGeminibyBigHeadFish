@@ -1,0 +1,30 @@
+{
+  "case_name": "LWD_Case2_HighRes_2MHz",
+  "grid": {
+    "nx": 100,
+    "ny": 100,
+    "nz": 100,
+    "dx_min": 0.01,
+    "stretch_ratio": 1.1
+  },
+  "source": {
+    "type": "magnetic_dipole",
+    "frequency": 2000000.0,
+    "position": [0.0, 0.0, 0.0],
+    "direction": [0.0, 0.0, 1.0],
+    "amplitude": 1.0
+  },
+  "model": {
+    "type": "chirp_formation",
+    "bg_rho": 1.0,
+    "pml_layers": 8,
+    "note": "Alternating beds of 0.1m to 1.0m thickness"
+  },
+  "receiver": {
+    "type": "full_grid",
+    "output_file": "output_case2_2mhz"
+  },
+  "validation": {
+    "enabled": false
+  }
+}

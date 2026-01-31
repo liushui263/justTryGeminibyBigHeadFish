@@ -1,0 +1,77 @@
+{
+  "case_name": "Jaysaval_2016_Shallow_Water_TTI_Verification",
+  "grid": {
+    "nx": 120,
+    "ny": 80,
+    "nz": 100,
+    "dx_min": 50.0,
+    "stretch_ratio": 1.05
+  },
+  "source": {
+    "type": "electric_dipole",
+    "frequency": 0.5,
+    "position": [0.0, 0.0, -30.0], 
+    "direction": [1.0, 0.0, 0.0],
+    "amplitude": 1.0,
+    "note": "HED source towed 30m above seabed (z=0)"
+  },
+  "model": {
+    "type": "layered_tti",
+    "bg_rho": 1.0,
+    "pml_layers": 10,
+    "layers": [
+      {
+        "name": "Air",
+        "z_bottom": -200.0,
+        "rho_h": 1000000.0,
+        "rho_v": 1000000.0,
+        "dip": 0.0,
+        "azimuth": 0.0
+      },
+      {
+        "name": "Seawater",
+        "z_bottom": 0.0,
+        "rho_h": 0.3125,
+        "rho_v": 0.3125,
+        "dip": 0.0,
+        "azimuth": 0.0
+      },
+      {
+        "name": "Overburden",
+        "z_bottom": 1500.0,
+        "rho_h": 1.0,
+        "rho_v": 2.0,
+        "dip": -20.0,
+        "azimuth": 0.0
+      },
+      {
+        "name": "Resistor",
+        "z_bottom": 1600.0,
+        "rho_h": 20.0,
+        "rho_v": 20.0,
+        "dip": -20.0,
+        "azimuth": 0.0
+      },
+      {
+        "name": "Underburden",
+        "z_bottom": 99999.0,
+        "rho_h": 2.0,
+        "rho_v": 4.0,
+        "dip": -20.0,
+        "azimuth": 0.0
+      }
+    ]
+  },
+  "receiver": {
+    "type": "line",
+    "start": [-10000.0, 0.0, 0.0],
+    "end": [10000.0, 0.0, 0.0],
+    "step": 1000.0,
+    "output_file": "output_jaysaval_verification"
+  },
+  "validation": {
+    "enabled": true,
+    "mode": "file",
+    "reference_file": "jaysaval_table_a1.csv"
+  }
+}

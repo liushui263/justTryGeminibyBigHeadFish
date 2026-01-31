@@ -12,4 +12,13 @@ public:
         double rho_t, double rho_n, 
         double theta, double phi
     );
+
+     static MaterialProperty compute_cell_material_(
+        int i, int j, int k, 
+        const GridInfo& grid, 
+        int n_pml, 
+        double omega,
+        double rho_t, double rho_n, 
+        double theta, double phi
+    );
 };

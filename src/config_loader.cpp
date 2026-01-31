@@ -1,82 +1,63 @@
 #include "config_types.h"
 #include <fstream>
 #include <iostream>
-#include <sstream>
-#include <algorithm>
+#include <nlohmann/json.hpp>
 
-// 简单的字符串辅助函数
-std::string clean_str(std::string s) {
-    s.erase(remove(s.begin(), s.end(), '\"'), s.end());
-    s.erase(remove(s.begin(), s.end(), ','), s.end());
-    s.erase(remove(s.begin(), s.end(), ':'), s.end());
-    s.erase(remove(s.begin(), s.end(), '}'), s.end());
-    s.erase(remove(s.begin(), s.end(), '{'), s.end());
-    return s;
-}
+using json = nlohmann::json;
 
-// 极其简易的解析器：逐行查找关键词
-// 注意：这只是为了演示无依赖环境下的方案。生产环境请使用 nlohmann/json。
+// 使用 nlohmann/json 解析 JSON 配置
 SimulationConfig load_config(const std::string& filename) {
-    SimulationConfig cfg;
     std::ifstream file(filename);
     if (!file.is_open()) {
-        std::cerr << "Error: Cannot open config file " << filename << std::endl;
-        exit(1);
-    }
-
-    std::string line, key;
-    while (file >> key) {
-        key = clean_str(key);
-        
-        // --- General ---
-        if (key == "case_name") file >> cfg.case_name;
-        
-        // --- Source ---
-        else if (key == "source_type") file >> cfg.source.type;
-        else if (key == "frequency") file >> cfg.source.frequency;
-        else if (key == "src_pos") {
-            file >> cfg.source.position[0] >> cfg.source.position[1] >> cfg.source.position[2];
-        }
-        else if (key == "src_dir") {
-            file >> cfg.source.direction[0] >> cfg.source.direction[1] >> cfg.source.direction[2];
-        }
-        else if (key == "amplitude") file >> cfg.source.amplitude;
-
-        // --- Model ---
-        else if (key == "model_type") file >> cfg.model.type;
-        else if (key == "bg_rho") file >> cfg.model.bg_rho;
-        else if (key == "pml_layers") file >> cfg.model.pml_layers;
-
-        // --- Grid ---
-        else if (key == "nx") file >> cfg.grid.nx;
-        else if (key == "ny") file >> cfg.grid.ny;
-        else if (key == "nz") file >> cfg.grid.nz;
-        else if (key == "dx_min") file >> cfg.grid.dx_min;
-        else if (key == "stretch_ratio") file >> cfg.grid.stretch_ratio;
-
-        // --- Receiver ---
-        else if (key == "receiver_type") file >> cfg.receiver.type;
-        else if (key == "output_file") file >> cfg.receiver.output_file;
-        else if (key == "receiver_points") {
-             // 简易处理：假设只有两个点用于测试
-             double x, y, z;
-             // Read until "]" or specific count. Simplified for demo:
-             // 实际上这需要复杂的 parser。这里我们先留空，在 main 中硬编码测试列表
-        }
-        
-        // --- Validation ---
-        else if (key == "validation_enable") {
-            std::string val; file >> val;
-            cfg.validation.enabled = (val == "true");
-        }
+        throw std::runtime_error("Cannot open config file: " + filename);
     }
     
-    // 清理字符串残留
-    cfg.case_name = clean_str(cfg.case_name);
-    cfg.source.type = clean_str(cfg.source.type);
-    cfg.model.type = clean_str(cfg.model.type);
-    cfg.receiver.type = clean_str(cfg.receiver.type);
-    cfg.receiver.output_file = clean_str(cfg.receiver.output_file);
+    json j;
+    file >> j;
+    file.close();
+    
+    SimulationConfig cfg;
+    
+    // 解析网格参数
+    if (j.contains("grid")) {
+        auto& g = j["grid"];
+        cfg.grid.nx = g.value("nx", 64);
+        cfg.grid.ny = g.value("ny", 64);
+        cfg.grid.nz = g.value("nz", 64);
+        cfg.grid.dx_min = g.value("dx_min", 0.5);
+        cfg.grid.stretch_ratio = g.value("stretch_ratio", 1.1);
+    }
+    
+    // 解析源项参数
+    if (j.contains("source")) {
+        auto& s = j["source"];
+        cfg.source.type = s.value("type", "magnetic_dipole");
+        cfg.source.frequency = s.value("frequency", 500.0);
+        cfg.source.amplitude = s.value("amplitude", 1.0);
+        if (s.contains("position")) cfg.source.position = s["position"].get<std::vector<double>>();
+        if (s.contains("direction")) cfg.source.direction = s["direction"].get<std::vector<double>>();
+    }
+    
+    // 解析模型参数
+    if (j.contains("model")) {
+        auto& m = j["model"];
+        cfg.model.bg_rho = m.value("bg_rho", 1.0);
+        cfg.model.pml_layers = m.value("pml_layers", 8);
+    }
+    
+    // 解析接收器参数
+    if (j.contains("receiver")) {
+        auto& r = j["receiver"];
+        cfg.receiver.type = r.value("type", "full_grid");
+        cfg.receiver.output_file = r.value("output_file", "output");
+    }
+    
+    // 解析验证参数
+    if (j.contains("validation")) {
+        auto& v = j["validation"];
+        cfg.validation.enabled = v.value("enabled", false);
+        cfg.validation.mode = v.value("mode", "analytical");
+    }
     
     return cfg;
 }

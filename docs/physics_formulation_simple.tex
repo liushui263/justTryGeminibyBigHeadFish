@@ -1,0 +1,122 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{geometry}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{physics}
+
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+
+\title{\textbf{BigHeadFish Solver: Physics and Mathematical Formulation}}
+\author{Project Documentation}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+The \textbf{BigHeadFish Solver} is a 3D Finite-Difference Frequency-Domain (FDFD) electromagnetic simulation engine designed for Logging-While-Drilling (LWD) applications. It solves the vector wave equation in anisotropic media using a staggered grid (Yee grid) approach with non-uniform discretization and Perfectly Matched Layers (PML) absorbing boundary conditions.
+
+\section{Governing Equations}
+The solver is based on the frequency-domain Maxwell's equations assuming a time-harmonic dependence of $e^{-i\omega t}$. In conductive media typical of geophysical formations, displacement currents ($\epsilon$) are negligible compared to conduction currents ($\sigma$). The system is governed by the vector wave equation for the electric field $\mathbf{E}$:
+
+\begin{equation}
+\nabla \times \left( \mu^{-1} \nabla \times \mathbf{E} \right) - i\omega \hat{\sigma} \mathbf{E} = i\omega \mathbf{J}_s
+\end{equation}
+
+Where:
+\begin{itemize}
+    \item $\mathbf{E}$ is the electric field vector [V/m].
+    \item $\mu$ is the magnetic permeability (assumed $\mu_0$).
+    \item $\omega = 2\pi f$ is the angular frequency.
+    \item $\hat{\sigma}$ is the anisotropic electrical conductivity tensor [S/m].
+    \item $\mathbf{J}_s$ is the electric source current density.
+\end{itemize}
+
+\section{Material Properties: Tilted Transverse Isotropy (TTI)}
+The solver models geological formations as anisotropic media. The conductivity tensor $\hat{\sigma}$ in the principal axes ($x', y', z'$) is defined as:
+\begin{equation}
+\hat{\sigma}_{principal} = \begin{pmatrix}
+\sigma_h & 0 & 0 \\
+0 & \sigma_h & 0 \\
+0 & 0 & \sigma_v
+\end{pmatrix}
+\end{equation}
+where $\sigma_h = 1/\rho_h$ is the horizontal conductivity and $\sigma_v = 1/\rho_v$ is the vertical conductivity.
+
+To transform this to the Cartesian coordinate system $(x,y,z)$, we apply rotation matrices based on the dip angle ($\theta$) and azimuth angle ($\phi$):
+\begin{equation}
+\hat{\sigma} = R^T \hat{\sigma}_{principal} R
+\end{equation}
+where $R$ is the Euler rotation matrix.
+
+\section{Domain Truncation: Perfectly Matched Layers (PML)}
+To simulate an infinite domain within a finite computational box, we utilize the Complex Coordinate Stretching technique (PML). This transforms the spatial derivatives $\partial_\xi$ into $\frac{1}{s_\xi} \partial_\xi$, where $\xi \in \{x, y, z\}$. The stretching factor $s_\xi$ is defined as:
+
+\begin{equation}
+s_\xi(\xi) = 1 + i \frac{\sigma_{PML}(\xi)}{\omega \epsilon_0}
+\end{equation}
+
+In the code, the PML profile follows a cubic ramp polynomial:
+\begin{equation}
+\sigma_{PML}(d) = \sigma_{max} \left( \frac{d}{L_{pml}} \right)^3
+\end{equation}
+where $d$ is the distance from the inner PML interface and $L_{pml}$ is the thickness of the PML region.
+
+\section{Numerical Discretization (FDFD)}
+
+\subsection{Non-Uniform Staggered Grid}
+The domain is discretized using a non-uniform Yee grid. The field components are staggered:
+\begin{itemize}
+    \item $E_x$ is located at $(i+1/2, j, k)$
+    \item $E_y$ is located at $(i, j+1/2, k)$
+    \item $E_z$ is located at $(i, j, k+1/2)$
+\end{itemize}
+This arrangement naturally satisfies the divergence conditions and simplifies the implementation of the curl operators.
+
+\subsection{Finite Difference Operators}
+We define two types of edge lengths for the non-uniform grid:
+\begin{itemize}
+    \item \textbf{Primary Edge Length ($\Delta l$)}: The distance between integer nodes (used for $\nabla \times \mathbf{E}$).
+    \item \textbf{Dual Edge Length ($\Delta l^*$)}: The distance between half-integer centers (used for $\nabla \times \mathbf{H}$).
+\end{itemize}
+
+The discretized curl-curl operator $\nabla \times \mu^{-1} \nabla \times \mathbf{E}$ for the $E_x$ component at index $(i,j,k)$ is approximated as:
+
+\begin{align}
+\left[ \nabla \times \nabla \times \mathbf{E} \right]_x \approx \quad & \frac{1}{\Delta y^*_j} \left( \frac{E_{x, j} - E_{x, j-1}}{\Delta y_{j-1}} - \frac{E_{x, j+1} - E_{x, j}}{\Delta y_j} \right) \nonumber \\
++ & \frac{1}{\Delta z^*_k} \left( \frac{E_{x, k} - E_{x, k-1}}{\Delta z_{k-1}} - \frac{E_{x, k+1} - E_{x, k}}{\Delta z_k} \right)
+\end{align}
+\textit{(Note: Cross-terms are omitted for brevity but are handled in the general anisotropic assembler.)}
+
+\subsection{Linear System Assembly}
+The discretization results in a sparse linear system of the form:
+\begin{equation}
+\mathbf{A} \mathbf{x} = \mathbf{b}
+\end{equation}
+where:
+\begin{itemize}
+    \item $\mathbf{A} = \mathbf{K} - i\omega \mathbf{M}$ is the system matrix.
+    \item $\mathbf{K}$ represents the stiffness matrix (Curl-Curl operator).
+    \item $\mathbf{M}$ represents the mass matrix (Conductivity/PML terms).
+    \item $\mathbf{x}$ is the vector of unknown electric field components ($E_x, E_y, E_z$).
+    \item $\mathbf{b}$ is the source vector ($i\omega \mathbf{J}_s$).
+\end{itemize}
+
+\section{Source Modeling}
+The solver supports two types of sources:
+\begin{enumerate}
+    \item \textbf{Electric Dipole (Mini-Bait)}: Modeled as a current density $\mathbf{J}$ applied directly to the edge corresponding to the dipole direction.
+    \item \textbf{Magnetic Dipole (Gem-Bait)}: Modeled as a small current loop. A magnetic dipole $\mathbf{M}$ along the $z$-axis is implemented as four electric currents forming a loop in the $xy$-plane surrounding the source node.
+\end{enumerate}
+
+\section{Grid Stretching Strategy}
+To handle low frequencies (e.g., 500 Hz) where wavelengths are large, while maintaining high resolution near the source, we use geometric grid stretching:
+\begin{equation}
+\Delta x_{i+1} = \Delta x_i \times r
+\end{equation}
+where $r$ is the stretch ratio (e.g., 1.15). This allows the simulation domain to extend to hundreds of meters without an excessive number of grid points.
+
+\end{document}

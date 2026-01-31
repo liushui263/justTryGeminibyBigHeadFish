@@ -1,0 +1,48 @@
+{
+  "case_name": "LWD_Case1_DeepReading_500Hz",
+  "grid": {
+    "nx": 80,
+    "ny": 80,
+    "nz": 80,
+    "dx_min": 0.05,
+    "stretch_ratio": 1.15
+  },
+  "source": {
+    "type": "magnetic_dipole",
+    "frequency": 500.0,
+    "position": [0.0, 0.0, 0.0],
+    "direction": [0.0, 0.0, 1.0],
+    "amplitude": 1.0,
+    "note": "Standard LWD Z-coil"
+  },
+  "model": {
+    "type": "layered_tti",
+    "pml_layers": 8,
+    "layers": [
+      {
+        "name": "Conductive_Bed",
+        "z_bottom": 10.0,
+        "rho_h": 1.0,
+        "rho_v": 1.0,
+        "dip": 30.0,
+        "azimuth": 0.0
+      },
+      {
+        "name": "Resistive_Bed",
+        "z_bottom": 9999.0,
+        "rho_h": 20.0,
+        "rho_v": 20.0,
+        "dip": 30.0,
+        "azimuth": 0.0
+      }
+    ]
+  },
+  "receiver": {
+    "type": "full_grid",
+    "output_file": "output_case1_500hz"
+  },
+  "validation": {
+    "enabled": false,
+    "mode": "none"
+  }
+}

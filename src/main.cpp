@@ -3,16 +3,16 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
-#include <algorithm> // <--- 之前缺失的关键头文件 (用于 std::min_element)
-#include <iterator>  // 用于 std::distance
+#include <algorithm>
+#include <iterator>
 #include "physics_utils.h"
 #include "assembler.h"
 #include "solver.h"
 #include "analytical.h"
 #include "exporter.h"
 #include "config_types.h" 
+#include <chrono>
 
-// 声明解析函数 (在 config_loader.cpp 中实现)
 SimulationConfig load_config(const std::string& filename);
 
 // --- 辅助：网格生成 ---
@@ -46,181 +46,239 @@ int find_nearest_node(const std::vector<double>& nodes, double val) {
 
 // --- 核心：通用源施加 ---
 void apply_source_generic(
-    const SourceConfig& src, 
-    const GridInfo& grid, 
+    const SourceConfig& src,
+    const GridInfo& grid,
     std::vector<cuComplexType>& rhs
 ) {
-    // 1. 找到源在网格中的索引
+    std::cout << "\n=== apply_source_generic called ===\n";
+    std::cout << "Source type: " << src.type << "\n";
+    std::cout << "Source position: (" << src.position[0] << ", " << src.position[1] << ", " << src.position[2] << ")\n";
+    std::cout << "Source direction: (" << src.direction[0] << ", " << src.direction[1] << ", " << src.direction[2] << ")\n";
+    std::cout << "Source amplitude: " << src.amplitude << "\n";
+
     int ix = find_nearest_node(grid.x_nodes, src.position[0]);
     int iy = find_nearest_node(grid.y_nodes, src.position[1]);
     int iz = find_nearest_node(grid.z_nodes, src.position[2]);
-    
-    // 边界保护
-    if (ix >= grid.nx) ix = grid.nx-1; 
-    if (iy >= grid.ny) iy = grid.ny-1; 
-    if (iz >= grid.nz) iz = grid.nz-1;
-
-    double amp = src.amplitude;
-    double nx = src.direction[0];
-    double ny = src.direction[1];
-    double nz = src.direction[2];
-
-    auto add_rhs = [&](int i, int j, int k, int comp, double val) {
-        long long idx = (long long)comp * grid.nx * grid.ny * grid.nz 
-                        + (long long)k * grid.nx * grid.ny 
-                        + (long long)j * grid.nx + i;
-        if(idx < (long long)rhs.size()) rhs[idx].x += (float)val;
-    };
 
     if (src.type == "magnetic_dipole") {
-        // 磁偶极子 M (电流环)
-        // M_z (在 XY 平面上的环)
-        if (std::abs(nz) > 1e-6) {
-            double mz = amp * nz;
-            add_rhs(ix, iy, iz, 0, -mz);    // Ex(y_bot)
-            add_rhs(ix, iy+1, iz, 0, mz);   // Ex(y_top)
-            add_rhs(ix, iy, iz, 1, mz);     // Ey(x_left)
-            add_rhs(ix+1, iy, iz, 1, -mz);  // Ey(x_right)
+        double mz = src.direction[2];
+        if (std::abs(mz) > 1e-12) {
+            long long idx_ex = (long long)0 * grid.nx * grid.ny * grid.nz + iz * grid.nx * grid.ny + iy * grid.nx + ix;
+            long long idx_ey = (long long)1 * grid.nx * grid.ny * grid.nz + iz * grid.nx * grid.ny + iy * grid.nx + ix;
+            if (idx_ex < (long long)rhs.size()) rhs[idx_ex].x += (float)(src.amplitude * mz);
+            if (idx_ey < (long long)rhs.size()) rhs[idx_ey].x -= (float)(src.amplitude * mz);
         }
-        // M_x (在 YZ 平面上的环)
-        if (std::abs(nx) > 1e-6) {
-            double mx = amp * nx;
-            add_rhs(ix, iy, iz, 1, -mx);    // Ey(z_bot)
-            add_rhs(ix, iy, iz+1, 1, mx);   // Ey(z_top)
-            add_rhs(ix, iy, iz, 2, mx);     // Ez(y_left)
-            add_rhs(ix, iy+1, iz, 2, -mx);  // Ez(y_right)
-        }
-        // M_y (在 XZ 平面上的环)
-        if (std::abs(ny) > 1e-6) {
-            double my = amp * ny;
-            add_rhs(ix, iy, iz, 2, -my);    // Ez(x_left)
-            add_rhs(ix+1, iy, iz, 2, my);   // Ez(x_right)
-            add_rhs(ix, iy, iz, 0, my);     // Ex(z_bot)
-            add_rhs(ix, iy, iz+1, 0, -my);  // Ex(z_top)
-        }
-    } else if (src.type == "electric_dipole") {
-        // 电偶极子 J (直接加在边上)
-        // 注意：这里做最简单的最近邻插值。更精确的做法是将 J 分配到周围的边上。
-        if (std::abs(nx) > 1e-6) add_rhs(ix, iy, iz, 0, amp * nx);
-        if (std::abs(ny) > 1e-6) add_rhs(ix, iy, iz, 1, amp * ny);
-        if (std::abs(nz) > 1e-6) add_rhs(ix, iy, iz, 2, amp * nz);
     }
 }
 
-// --- 材料生成 (支持简单模型) ---
+// --- 材料生成函数 ---
 std::vector<MaterialProperty> generate_materials(const SimulationConfig& cfg, const GridInfo& grid, double omega) {
-    long long total_cells = (long long)grid.nx * grid.ny * grid.nz;
-    std::vector<MaterialProperty> materials(total_cells);
+    std::vector<MaterialProperty> materials(grid.total_unknowns());
     
-    // 默认简单模型
-    double rho = cfg.model.bg_rho;
-    double sigma_bg = 1.0 / rho;
+    double mu = 4.0 * M_PI * 1.0e-7;
+    double bg_sigma = 1.0 / cfg.model.bg_rho;
     
-    // 自动调节 PML 强度: 频率越低(波长越长)，需要的 PML 越强
-    double sigma_pml_max = sigma_bg * 50.0; 
-    int n_pml = cfg.model.pml_layers;
-
     #pragma omp parallel for
-    for (int idx = 0; idx < total_cells; ++idx) {
-        int k = idx / (grid.nx * grid.ny);
-        int rem = idx % (grid.nx * grid.ny);
-        int j = rem / grid.nx;
-        int i = rem % grid.nx;
-
-        MaterialProperty mat;
-        mat.sigma_eff.set_isotropic({(float)sigma_bg, 0.0f});
-        float mu_inv = 1.0f / (4.0f * M_PI * 1e-7f);
-        mat.mu_inv_eff.set_isotropic({mu_inv, 0.0f});
-
-        // PML Logic (Simplified Index Based)
-        auto get_pml = [&](int idx, int max) {
-            if(idx < n_pml) return sigma_pml_max * std::pow((double)(n_pml-idx)/n_pml, 3);
-            if(idx >= max-n_pml) return sigma_pml_max * std::pow((double)(idx-(max-n_pml-1))/n_pml, 3);
-            return 0.0;
-        };
-        double px = get_pml(i, grid.nx);
-        double py = get_pml(j, grid.ny);
-        double pz = get_pml(k, grid.nz);
-        
-        double total_pml = px + py + pz;
-        if (total_pml > 0) {
-            Complex c = mat.sigma_eff.val[0];
-            mat.sigma_eff.set_isotropic({c.real() + (float)total_pml, c.imag()});
+    for (int k = 0; k < grid.nz; ++k) {
+        for (int j = 0; j < grid.ny; ++j) {
+            for (int i = 0; i < grid.nx; ++i) {
+                int mat_idx = k * grid.nx * grid.ny + j * grid.nx + i;
+                
+                materials[mat_idx].sigma_eff.val[0] = Complex(bg_sigma, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[0] = Complex(1.0f / mu, 0.0f);
+                materials[mat_idx].sigma_eff.val[1] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[1] = Complex(0.0f, 0.0f);
+                materials[mat_idx].sigma_eff.val[2] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[2] = Complex(0.0f, 0.0f);
+                materials[mat_idx].sigma_eff.val[3] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[3] = Complex(0.0f, 0.0f);
+                materials[mat_idx].sigma_eff.val[4] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[4] = Complex(0.0f, 0.0f);
+                materials[mat_idx].sigma_eff.val[5] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[5] = Complex(0.0f, 0.0f);
+                materials[mat_idx].sigma_eff.val[6] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[6] = Complex(0.0f, 0.0f);
+                materials[mat_idx].sigma_eff.val[7] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[7] = Complex(0.0f, 0.0f);
+                materials[mat_idx].sigma_eff.val[8] = Complex(0.0f, 0.0f);
+                materials[mat_idx].mu_inv_eff.val[8] = Complex(0.0f, 0.0f);
+            }
         }
-        materials[idx] = mat;
     }
+    
     return materials;
 }
 
-int main(int argc, char** argv) {
-    std::string config_file = "test_500hz.json"; // 默认输入文件
-    if (argc > 1) config_file = argv[1];
-
-    std::cout << "=== Universal LWD Solver (BigHeadFish) ===" << std::endl;
-    std::cout << "Loading config: " << config_file << std::endl;
-
-    // 1. 加载配置
+// --- 主函数 ---
+int main(int argc, char* argv[]) {
+    std::string config_file = "test_500hz.json";
+    if (argc > 1) {
+        config_file = argv[1];
+    }
+    
+    std::cout << "Loading config from: " << config_file << std::endl;
     SimulationConfig cfg = load_config(config_file);
-
-    // 2. 生成网格
+    
+    // Create grid
     GridInfo grid;
-    grid.nx = cfg.grid.nx; grid.ny = cfg.grid.ny; grid.nz = cfg.grid.nz;
-    grid.x_nodes = generate_stretched_coords(grid.nx, cfg.grid.dx_min, cfg.grid.stretch_ratio);
-    grid.y_nodes = generate_stretched_coords(grid.ny, cfg.grid.dx_min, cfg.grid.stretch_ratio);
-    grid.z_nodes = generate_stretched_coords(grid.nz, cfg.grid.dx_min, cfg.grid.stretch_ratio);
-
-    std::cout << "Grid: " << grid.nx << "x" << grid.ny << "x" << grid.nz 
-              << " (Min dx=" << cfg.grid.dx_min << ")" << std::endl;
-
-    // 3. 准备物理参数
+    grid.nx = cfg.grid.nx;
+    grid.ny = cfg.grid.ny;
+    grid.nz = cfg.grid.nz;
+    grid.x_nodes = generate_stretched_coords(cfg.grid.nx, cfg.grid.dx_min, cfg.grid.stretch_ratio);
+    grid.y_nodes = generate_stretched_coords(cfg.grid.ny, cfg.grid.dx_min, cfg.grid.stretch_ratio);
+    grid.z_nodes = generate_stretched_coords(cfg.grid.nz, cfg.grid.dx_min, cfg.grid.stretch_ratio);
+    
+    // Compute omega
     double omega = 2.0 * M_PI * cfg.source.frequency;
+    
+    // Generate materials
     auto materials = generate_materials(cfg, grid, omega);
-
-    // 4. 组装矩阵
-    std::cout << "Assembling Matrix..." << std::endl;
-    Assembler assembler(grid, omega, false); // Default direct method
+    
+    // Assemble system matrix
+    std::cout << "Assembling system matrix..." << std::endl;
+    Assembler assembler(grid, omega);
     CsrMatrix A = assembler.assemble_system_matrix(materials);
-    std::cout << "NNZ: " << A.nnz << std::endl;
-
-    // 5. 施加源
-    std::vector<cuComplexType> rhs(A.num_rows, {0.0f, 0.0f});
+    
+    // Initialize RHS
+    std::vector<cuComplexType> rhs(grid.total_unknowns(), {0.0f, 0.0f});
+    
+    // Apply source
+    std::cout << "Applying source..." << std::endl;
     apply_source_generic(cfg.source, grid, rhs);
-
-    // 6. 求解
-    std::cout << "Solving..." << std::endl;
-    std::vector<cuComplexType> x;
+    
+    std::cout << "\n=== Diagnostic: RHS magnitudes ===" << std::endl;
+    float max_rhs = 0.0f;
+    int max_idx = 0;
+    for (int i = 0; i < (int)rhs.size(); ++i) {
+        float mag = std::sqrt(rhs[i].x * rhs[i].x + rhs[i].y * rhs[i].y);
+        if (mag > max_rhs) {
+            max_rhs = mag;
+            max_idx = i;
+        }
+    }
+    std::cout << "Max RHS magnitude: " << max_rhs << " at index " << max_idx << std::endl;
+    std::cout << "RHS size: " << rhs.size() << std::endl;
+    
+    // Print first few RHS values
+    std::cout << "\nFirst 5 RHS values:" << std::endl;
+    for (int i = 0; i < std::min(5, (int)rhs.size()); ++i) {
+        std::cout << "  rhs[" << i << "] = " << rhs[i].x << " + i" << rhs[i].y << std::endl;
+    }
+    
+    // Frequency check
+    std::cout << "\nFrequency: " << cfg.source.frequency << " Hz" << std::endl;
+    std::cout << "Angular frequency (omega): " << omega << " rad/s" << std::endl;
+    
+    // Create solver and result vector
     Solver solver;
-    try {
-        solver.solve(A, rhs, x);
-        std::cout << "Solved." << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "Solver Failed: " << e.what() << std::endl;
-        return 1;
+    std::vector<cuComplexType> x(rhs.size(), make_cuComplex(0.0f, 0.0f));
+    
+    // --- Debug: Source Location RHS Inspection ---
+    int nx = grid.nx, ny = grid.ny, nz = grid.nz;
+    int sx =grid.nx/2, sy = grid.ny/2, sz = grid.nz/2; // Your source grid index from logs
+    
+    std::cout << "\n=== Source Location RHS Debug (Index: " << sx << ", " << sy << ", " << sz << ") ===" << std::endl;
+    for (int comp = 0; comp < 3; ++comp) {
+        long long center_idx = (long long)comp * nx * ny * nz + (long long)sz * nx * ny + (long long)sy * nx + sx;
+        
+        // Convert cuComplex to a printable format
+        auto val = rhs[center_idx];
+        std::cout << "Comp " << comp << " at source: " << val.x << " + i" << val.y << std::endl;
+        
+        // Check one neighbor in X to see if it's a "point" or "distributed" source
+        long long neighbor_idx = center_idx + 1;
+        auto n_val = rhs[neighbor_idx];
+        std::cout << "  Neighbor (X+1): " << n_val.x << " + i" << n_val.y << std::endl;
+    }
+    std::cout << "==========================================\n" << std::endl;
+
+    std::cout << "Solving..." << std::endl;
+    auto t_solve_start = std::chrono::high_resolution_clock::now();
+    
+    solver.solve(A, rhs, x);
+    
+    auto t_solve_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Solver time: "
+              << std::chrono::duration<double>(t_solve_end - t_solve_start).count() << " s" << std::endl;
+    
+    // Field at source
+    int ix_src = find_nearest_node(grid.x_nodes, cfg.source.position[0]);
+    int iy_src = find_nearest_node(grid.y_nodes, cfg.source.position[1]);
+    int iz_src = find_nearest_node(grid.z_nodes, cfg.source.position[2]);
+    
+    std::cout << "\n=== Field at source location ===" << std::endl;
+    std::cout << "Source grid index: (" << ix_src << ", " << iy_src << ", " << iz_src << ")" << std::endl;
+    for (int comp = 0; comp < 3; ++comp) {
+        long long idx = (long long)comp * grid.nx * grid.ny * grid.nz 
+                      + iz_src * grid.nx * grid.ny 
+                      + iy_src * grid.nx + ix_src;
+        if (idx < (long long)x.size()) {
+            std::cout << "E[" << comp << "] = " << x[idx].x << " + i " << x[idx].y << std::endl;
+        }
     }
 
-    // 7. 输出
+    std::cout << "\n=== Field magnitudes ===" << std::endl;
+    for (int comp = 0; comp < 3; ++comp) {
+        float max_mag = 0.0f;
+        for (int idx = 0; idx < (int)x.size(); ++idx) {
+            float mag = std::sqrt(x[idx].x * x[idx].x + x[idx].y * x[idx].y);
+            max_mag = std::max(max_mag, mag);
+        }
+        std::cout << "Component " << comp << ": max magnitude = " << max_mag << std::endl;
+    }
+    
+    // Export results
     if (cfg.receiver.type == "full_grid") {
         std::string vtk_name = cfg.receiver.output_file + ".vtr";
         VtkExporter::save_to_vtr(vtk_name, grid, x);
-        std::cout << "Full field saved to " << vtk_name << std::endl;
-    } 
+        std::cout << "Exported to " << vtk_name << std::endl;
+    }
     
-    // 8. 验证
     if (cfg.validation.enabled && cfg.validation.mode == "analytical") {
-        std::cout << "[Validation] Comparing with Analytical Solution..." << std::endl;
-        // 计算源中心索引 (近似)
-        int ix = find_nearest_node(grid.x_nodes, cfg.source.position[0]);
-        int iy = find_nearest_node(grid.y_nodes, cfg.source.position[1]);
-        int iz = find_nearest_node(grid.z_nodes, cfg.source.position[2]);
-        
-        auto exact = AnalyticalSolution::compute_field(
-            1.0/cfg.model.bg_rho, cfg.source.frequency, grid, 
-            ix+0.5, iy+0.5, iz+0.5, 
+        auto x_analytical = AnalyticalSolution::compute_field(
+            cfg.model.bg_rho, cfg.source.frequency, grid,
+            (double)ix_src, (double)iy_src, (double)iz_src,
             cfg.source.direction[0], cfg.source.direction[1], cfg.source.direction[2]
         );
-        VtkExporter::save_to_vtr(cfg.receiver.output_file + "_analytical.vtr", grid, exact);
-        std::cout << "Analytical solution saved to " << cfg.receiver.output_file + "_analytical.vtr" << std::endl;
+        std::string analytical_name = cfg.receiver.output_file + "_analytical.vtr";
+        VtkExporter::save_to_vtr(analytical_name, grid, x_analytical);
+        std::cout << "Exported analytical to " << analytical_name << std::endl;
+        
+        std::cout << "\n=== Field Comparison: Numerical vs Analytical ===" << std::endl;
+        
+        int i_near = ix_src + 1, j_near = iy_src, k_near = iz_src;
+        for (int comp = 0; comp < 3; ++comp) {
+            long long idx_num = (long long)comp * grid.nx * grid.ny * grid.nz 
+                              + k_near * grid.nx * grid.ny + j_near * grid.nx + i_near;
+            long long idx_ana = (long long)comp * grid.nx * grid.ny * grid.nz 
+                              + k_near * grid.nx * grid.ny + j_near * grid.nx + i_near;
+            
+            float mag_num = std::sqrt(x[idx_num].x * x[idx_num].x + x[idx_num].y * x[idx_num].y);
+            float mag_ana = std::sqrt(x_analytical[idx_ana].x * x_analytical[idx_ana].x 
+                                    + x_analytical[idx_ana].y * x_analytical[idx_ana].y);
+            
+            std::cout << "Comp " << comp << " near field: num=" << mag_num << ", ana=" << mag_ana 
+                      << ", ratio=" << (mag_ana > 1e-15 ? mag_num/mag_ana : 0) << std::endl;
+        }
+        
+        int i_far = ix_src + 20, j_far = iy_src, k_far = iz_src;
+        if (i_far < grid.nx) {
+            for (int comp = 0; comp < 3; ++comp) {
+                long long idx_num = (long long)comp * grid.nx * grid.ny * grid.nz 
+                                  + k_far * grid.nx * grid.ny + j_far * grid.nx + i_far;
+                long long idx_ana = (long long)comp * grid.nx * grid.ny * grid.nz 
+                                  + k_far * grid.nx * grid.ny + j_far * grid.nx + i_far;
+                
+                float mag_num = std::sqrt(x[idx_num].x * x[idx_num].x + x[idx_num].y * x[idx_num].y);
+                float mag_ana = std::sqrt(x_analytical[idx_ana].x * x_analytical[idx_ana].x 
+                                        + x_analytical[idx_ana].y * x_analytical[idx_ana].y);
+                
+                std::cout << "Comp " << comp << " far field: num=" << mag_num << ", ana=" << mag_ana 
+                          << ", ratio=" << (mag_ana > 1e-15 ? mag_num/mag_ana : 0) << std::endl;
+            }
+        }
     }
-
+    
     return 0;
 }
+

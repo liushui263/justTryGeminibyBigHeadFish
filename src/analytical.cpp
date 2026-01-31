@@ -12,7 +12,7 @@ Complex AnalyticalSolution::compute_k(double omega, double sigma) {
     double mu = 4.0 * M_PI * 1.0e-7;
     Real val = to_real(omega * mu * sigma);
     Complex i_complex(0.0f, 1.0f);
-    return std::sqrt(i_complex * val);
+    return std::sqrt(i_complex * val);  // k = sqrt(i*omega*mu*sigma)
 }
 
 void compute_vector_field(

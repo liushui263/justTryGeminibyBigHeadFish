@@ -1,99 +1,128 @@
 #include "solver.h"
 #include <iostream>
-#include <cuda_runtime.h>
-#include <cusparse.h>
-#include <cusolverSp.h>
+#include <stdexcept>
 #include <vector>
+#include <cmath>
+#include <cublas_v2.h>
+#include <cusparse.h>
 
-// 构造与析构函数实现
 Solver::Solver() {}
 Solver::~Solver() {}
 
-// 简单的 CUDA 错误检查宏
-#define check_cuda(status, msg) check_cuda_impl(status, msg, __LINE__)
-
-void check_cuda_impl(cudaError_t status, const char* msg, int line) {
-    if (status != cudaSuccess) {
-        std::cerr << "CUDA Error at line " << line << ": " << msg << " - " << cudaGetErrorString(status) << std::endl;
-        throw std::runtime_error("CUDA Error");
-    }
+// Helper for safe complex division on host
+static cuComplex complex_div(cuComplex a, cuComplex b) {
+    float denom = b.x * b.x + b.y * b.y;
+    if (denom < 1e-25f) return make_cuComplex(0.0f, 0.0f);
+    return make_cuComplex((a.x * b.x + a.y * b.y) / denom, (a.y * b.x - a.x * b.y) / denom);
 }
 
-void check_cusparse(cusparseStatus_t status, const char* msg) {
-    if (status != CUSPARSE_STATUS_SUCCESS) {
-        std::cerr << "cuSPARSE Error: " << msg << std::endl;
-        throw std::runtime_error("cuSPARSE Error");
-    }
-}
+void Solver::solve(const CsrMatrix& A, const std::vector<cuComplexType>& b, std::vector<cuComplexType>& x) {
+    int N = (int)b.size();
+    int nnz = (int)A.val.size();
 
-void check_cusolver(cusolverStatus_t status, const char* msg) {
-    if (status != CUSOLVER_STATUS_SUCCESS) {
-        std::cerr << "cuSolver Error: " << msg << std::endl;
-        throw std::runtime_error("cuSolver Error");
-    }
-}
+    cusparseHandle_t sp_handle;
+    cublasHandle_t cb_handle;
+    cusparseCreate(&sp_handle);
+    cublasCreate(&cb_handle);
 
-void Solver::solve(const CsrMatrix& A, const std::vector<cuComplexType>& rhs, std::vector<cuComplexType>& x) {
-    int N = A.num_rows;
-    int nnz = A.nnz;
-    
-    // 调整解向量大小并初始化
-    x.assign(N, {0.0f, 0.0f});
-
-    // 1. 初始化句柄
-    cusolverSpHandle_t solver_handle;
-    cusparseHandle_t sparse_handle;
-    check_cusolver(cusolverSpCreate(&solver_handle), "Create solver handle");
-    check_cusparse(cusparseCreate(&sparse_handle), "Create sparse handle");
-
-    // 2. 分配设备内存
+    cuComplexType *d_val, *d_b, *d_x, *d_r, *d_r_hat, *d_p, *d_v, *d_s, *d_t;
     int *d_row_ptr, *d_col_ind;
-    cuComplexType *d_val, *d_rhs, *d_x;
 
-    check_cuda(cudaMalloc(&d_row_ptr, (N + 1) * sizeof(int)), "Malloc row_ptr");
-    check_cuda(cudaMalloc(&d_col_ind, nnz * sizeof(int)), "Malloc col_ind");
-    check_cuda(cudaMalloc(&d_val, nnz * sizeof(cuComplexType)), "Malloc val");
-    check_cuda(cudaMalloc(&d_rhs, N * sizeof(cuComplexType)), "Malloc rhs");
-    check_cuda(cudaMalloc(&d_x, N * sizeof(cuComplexType)), "Malloc x");
+    cudaMalloc((void**)&d_val, nnz * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_row_ptr, (N + 1) * sizeof(int));
+    cudaMalloc((void**)&d_col_ind, nnz * sizeof(int));
+    cudaMalloc((void**)&d_b, N * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_x, N * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_r, N * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_r_hat, N * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_p, N * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_v, N * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_s, N * sizeof(cuComplexType));
+    cudaMalloc((void**)&d_t, N * sizeof(cuComplexType));
 
-    // 3. 拷贝数据 (Host -> Device)
-    check_cuda(cudaMemcpy(d_row_ptr, A.row_ptr.data(), (N + 1) * sizeof(int), cudaMemcpyHostToDevice), "Copy row_ptr");
-    check_cuda(cudaMemcpy(d_col_ind, A.col_ind.data(), nnz * sizeof(int), cudaMemcpyHostToDevice), "Copy col_ind");
-    check_cuda(cudaMemcpy(d_val, A.val.data(), nnz * sizeof(cuComplexType), cudaMemcpyHostToDevice), "Copy val");
-    check_cuda(cudaMemcpy(d_rhs, rhs.data(), N * sizeof(cuComplexType), cudaMemcpyHostToDevice), "Copy rhs");
-    
-    // 初始化解向量为0 (作为初始猜测)
-    check_cuda(cudaMemset(d_x, 0, N * sizeof(cuComplexType)), "Memset x");
+    cudaMemcpy(d_val, A.val.data(), nnz * sizeof(cuComplexType), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_row_ptr, A.row_ptr.data(), (N + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_col_ind, A.col_ind.data(), nnz * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, b.data(), N * sizeof(cuComplexType), cudaMemcpyHostToDevice);
+    cudaMemset(d_x, 0, N * sizeof(cuComplexType));
 
-    // 4. 创建矩阵描述符
-    cusparseMatDescr_t descrA;
-    check_cusparse(cusparseCreateMatDescr(&descrA), "Create MatDescr");
-    check_cusparse(cusparseSetMatType(descrA, CUSPARSE_MATRIX_TYPE_GENERAL), "Set MatType");
-    check_cusparse(cusparseSetMatIndexBase(descrA, CUSPARSE_INDEX_BASE_ZERO), "Set IndexBase");
+    cusparseSpMatDescr_t matA;
+    cusparseCreateCsr(&matA, N, N, nnz, d_row_ptr, d_col_ind, d_val,
+                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_C_32F);
 
-    // 5. 求解
-    // 使用 csrlsvqr (QR分解) 求解 Ax = b
-    // 注意：QR分解极其消耗显存。如果 N 很大 (如 80^3)，可能会显存不足 (OOM)。
-    // 如果遇到 OOM，需要换用迭代解法 (如 csrlsvlu 或外部迭代库)。
-    // 这里先尝试直接求解。
-    int singularity = 0;
-    
-    // 容差设为 1e-6
-    check_cusolver(cusolverSpCcsrlsvqr(
-        solver_handle, N, nnz, descrA, d_val, d_row_ptr, d_col_ind, 
-        d_rhs, 1e-6f, 0, d_x, &singularity), 
-        "Solver execution");
+    cusparseDnVecDescr_t vecP, vecV, vecS, vecT, vecR, vecX;
+    cusparseCreateDnVec(&vecP, N, d_p, CUDA_C_32F);
+    cusparseCreateDnVec(&vecV, N, d_v, CUDA_C_32F);
+    cusparseCreateDnVec(&vecS, N, d_s, CUDA_C_32F);
+    cusparseCreateDnVec(&vecT, N, d_t, CUDA_C_32F);
+    cusparseCreateDnVec(&vecR, N, d_r, CUDA_C_32F);
+    cusparseCreateDnVec(&vecX, N, d_x, CUDA_C_32F);
 
-    if (singularity != -1) {
-        std::cerr << "WARNING: Matrix is singular at index " << singularity << std::endl;
+    size_t bufferSize = 0;
+    void* d_buffer = nullptr;
+    cuComplexType one = {1.0f, 0.0f}, zero = {0.0f, 0.0f};
+    cusparseSpMV_bufferSize(sp_handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, vecP, &zero, vecV, CUDA_C_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
+    cudaMalloc(&d_buffer, bufferSize);
+
+    std::cout << "Starting Robust BiCGStab Solver..." << std::endl;
+    cudaMemcpy(d_r, d_b, N * sizeof(cuComplexType), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_r_hat, d_r, N * sizeof(cuComplexType), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_p, d_r, N * sizeof(cuComplexType), cudaMemcpyDeviceToDevice);
+
+    cuComplexType rho = {1.0f, 0.0f}, alpha = {1.0f, 0.0f}, omega = {1.0f, 0.0f};
+    cuComplexType rho_prev, r_hat_v, ts, tt;
+
+    for (int iter = 0; iter < 1000; ++iter) {
+        rho_prev = rho;
+        cublasCdotu(cb_handle, N, d_r_hat, 1, d_r, 1, &rho); 
+
+        if (std::isnan(rho.x) || (std::abs(rho.x) < 1e-25f && std::abs(rho.y) < 1e-25f)) break;
+
+        if (iter > 0) {
+            cuComplexType beta_val = complex_div(rho, rho_prev);
+            cuComplexType ratio_ao = complex_div(alpha, omega);
+            cuComplexType beta = make_cuComplex(beta_val.x * ratio_ao.x - beta_val.y * ratio_ao.y, beta_val.x * ratio_ao.y + beta_val.y * ratio_ao.x);
+
+            cuComplexType neg_omega = {-omega.x, -omega.y};
+            cublasCaxpy(cb_handle, N, &neg_omega, d_v, 1, d_p, 1); 
+            cublasCscal(cb_handle, N, &beta, d_p, 1);             
+            cublasCaxpy(cb_handle, N, &one, d_r, 1, d_p, 1);      
+        }
+
+        cusparseSpMV(sp_handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, vecP, &zero, vecV, CUDA_C_32F, CUSPARSE_SPMV_ALG_DEFAULT, d_buffer);
+        cublasCdotu(cb_handle, N, d_r_hat, 1, d_v, 1, &r_hat_v);
+        alpha = complex_div(rho, r_hat_v);
+
+        cudaMemcpy(d_s, d_r, N * sizeof(cuComplexType), cudaMemcpyDeviceToDevice);
+        cuComplexType neg_alpha = {-alpha.x, -alpha.y};
+        cublasCaxpy(cb_handle, N, &neg_alpha, d_v, 1, d_s, 1);
+
+        cusparseSpMV(sp_handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, matA, vecS, &zero, vecT, CUDA_C_32F, CUSPARSE_SPMV_ALG_DEFAULT, d_buffer);
+        cublasCdotu(cb_handle, N, d_t, 1, d_s, 1, &ts);
+        cublasCdotu(cb_handle, N, d_t, 1, d_t, 1, &tt);
+        omega = complex_div(ts, tt);
+
+        cublasCaxpy(cb_handle, N, &alpha, d_p, 1, d_x, 1);
+        cublasCaxpy(cb_handle, N, &omega, d_s, 1, d_x, 1);
+
+        cudaMemcpy(d_r, d_s, N * sizeof(cuComplexType), cudaMemcpyDeviceToDevice);
+        cuComplexType neg_omega = {-omega.x, -omega.y};
+        cublasCaxpy(cb_handle, N, &neg_omega, d_t, 1, d_r, 1);
+
+        float res_norm;
+        cublasScnrm2(cb_handle, N, d_r, 1, &res_norm);
+        if (res_norm < 1e-6f) {
+            std::cout << "Converged at " << iter << " res: " << res_norm << std::endl;
+            break;
+        }
     }
 
-    // 6. 拷贝回结果
-    check_cuda(cudaMemcpy(x.data(), d_x, N * sizeof(cuComplexType), cudaMemcpyDeviceToHost), "Copy result");
+    cudaMemcpy(x.data(), d_x, N * sizeof(cuComplexType), cudaMemcpyDeviceToHost);
 
-    // 7. 清理资源
-    check_cusparse(cusparseDestroyMatDescr(descrA), "Destroy MatDescr");
-    cudaFree(d_row_ptr); cudaFree(d_col_ind); cudaFree(d_val); cudaFree(d_rhs); cudaFree(d_x);
-    cusolverSpDestroy(solver_handle);
-    cusparseDestroy(sparse_handle);
+    cudaFree(d_val); cudaFree(d_row_ptr); cudaFree(d_col_ind);
+    cudaFree(d_b); cudaFree(d_x); cudaFree(d_r); cudaFree(d_r_hat);
+    cudaFree(d_p); cudaFree(d_v); cudaFree(d_s); cudaFree(d_t); cudaFree(d_buffer);
+    cusparseDestroySpMat(matA); cusparseDestroyDnVec(vecP); cusparseDestroyDnVec(vecV);
+    cusparseDestroyDnVec(vecS); cusparseDestroyDnVec(vecT); cusparseDestroyDnVec(vecR);
+    cusparseDestroyDnVec(vecX); cusparseDestroy(sp_handle); cublasDestroy(cb_handle);
 }

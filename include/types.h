@@ -2,7 +2,8 @@
 #include <vector>
 #include <cmath>
 #include <complex>
-#include <cuComplex.h> // 必须包含 CUDA 复数头文件
+#include <cuComplex.h>
+#include <array>
 
 // === 核心修复 ===
 // 定义 cuComplexType 为 cuComplex (float2)
@@ -19,6 +20,19 @@ struct Triplet {
     Complex val;
 };
 
+// Simple 3x3 matrix struct
+template<typename T>
+struct Matrix3x3 {
+    std::array<T, 9> val;
+    
+    Matrix3x3() : val{} {}
+    
+    void set_isotropic(const T& diag_val) {
+        val.fill(T{0, 0});
+        val[0] = val[4] = val[8] = diag_val;
+    }
+};
+
 // CSR 矩阵结构
 struct CsrMatrix {
     int num_rows;
@@ -31,56 +45,24 @@ struct CsrMatrix {
 
 struct GridInfo {
     int nx, ny, nz;
-    
-    // 存储节点坐标 (大小为 n+1)
     std::vector<double> x_nodes;
     std::vector<double> y_nodes;
     std::vector<double> z_nodes;
-
-    GridInfo() : nx(0), ny(0), nz(0) {}
     
-    // 兼容均匀网格构造
-    GridInfo(int nx_, int ny_, int nz_, double dx_, double dy_, double dz_) 
-        : nx(nx_), ny(ny_), nz(nz_) {
-        x_nodes.resize(nx + 1);
-        y_nodes.resize(ny + 1);
-        z_nodes.resize(nz + 1);
-        for(int i=0; i<=nx; ++i) x_nodes[i] = i * dx_;
-        for(int j=0; j<=ny; ++j) y_nodes[j] = j * dy_;
-        for(int k=0; k<=nz; ++k) z_nodes[k] = k * dz_;
-    }
-
-    double dx(int i) const { return x_nodes[i+1] - x_nodes[i]; }
-    double dy(int j) const { return y_nodes[j+1] - y_nodes[j]; }
-    double dz(int k) const { return z_nodes[k+1] - z_nodes[k]; }
-
-    double dx_dual(int i) const {
-        if (i == 0) return dx(0); 
-        if (i == nx) return dx(nx-1);
-        return (dx(i-1) + dx(i)) * 0.5;
-    }
-    double dy_dual(int j) const { 
-        if (j == 0) return dy(0);
-        if (j == ny) return dy(ny-1);
-        return (dy(j-1) + dy(j)) * 0.5;
-    }
-    double dz_dual(int k) const { 
-        if (k == 0) return dz(0);
-        if (k == nz) return dz(nz-1);
-        return (dz(k-1) + dz(k)) * 0.5;
-    }
+    long long total_unknowns() const { return (long long)3 * nx * ny * nz; }
     
-    long long total_unknowns() const { return (long long)nx * ny * nz * 3; }
+    double dx(int i) const { return (i < nx) ? x_nodes[i+1] - x_nodes[i] : 1.0; }
+    double dy(int j) const { return (j < ny) ? y_nodes[j+1] - y_nodes[j] : 1.0; }
+    double dz(int k) const { return (k < nz) ? z_nodes[k+1] - z_nodes[k] : 1.0; }
+    
+    double dx_dual(int i) const { return (i > 0) ? x_nodes[i] - x_nodes[i-1] : dx(0); }
+    double dy_dual(int j) const { return (j > 0) ? y_nodes[j] - y_nodes[j-1] : dy(0); }
+    double dz_dual(int k) const { return (k > 0) ? z_nodes[k] - z_nodes[k-1] : dz(0); }
 };
 
 struct MaterialProperty {
-    struct Tensor3 {
-        Complex val[9]; // 3x3 row-major
-        void set_isotropic(Complex c) {
-            for(int i=0; i<9; ++i) val[i] = {0,0};
-            val[0] = val[4] = val[8] = c;
-        }
-    } sigma_eff, mu_inv_eff;
+    Matrix3x3<Complex> sigma_eff;
+    Matrix3x3<Complex> mu_inv_eff;
 };
 
 enum class SubGrid { G000 }; 

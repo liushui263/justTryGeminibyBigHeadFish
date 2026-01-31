@@ -1,0 +1,28 @@
+{
+  "grid": {
+    "nx": 80,
+    "ny": 80,
+    "nz": 80,
+    "dx_min": 0.05,
+    "stretch_ratio": 1.1
+  },
+  "source": {
+    "type": "magnetic_dipole",
+    "frequency": 500.0,
+    "position": [0.0, 0.0, 0.0],
+    "direction": [0.0, 0.0, 1.0],
+    "amplitude": 1.0
+  },
+  "model": {
+    "bg_rho": 1.0,
+    "pml_layers": 8
+  },
+  "receiver": {
+    "type": "full_grid",
+    "output_file": "output_500hz"
+  },
+  "validation": {
+    "enabled": true,
+    "mode": "analytical"
+  }
+}

@@ -17,8 +17,34 @@ Complex get_pml_sigma(double dist, double L_pml, double sigma_max) {
     double val = sigma_max * std::pow(ratio, 3);
     return { (float)val, 0.0f }; 
 }
+MaterialProperty compute_cell_material(double bg_rho, double freq, double x, double y, double z) {
+    MaterialProperty mat;
+    
+    // Initialize all tensors to zero
+    for(int i = 0; i < 9; ++i) {
+        mat.sigma_eff.val[i] = {0.0f, 0.0f};
+        mat.mu_inv_eff.val[i] = {0.0f, 0.0f};
+    }
 
-MaterialProperty Physics::compute_cell_material(
+    double mu_0 = 4.0 * M_PI * 1e-7;
+    float mu_inv_val = static_cast<float>(1.0 / mu_0);
+
+    // Set diagonal mu_inv (Isotropic)
+    mat.mu_inv_eff.val[0] = {mu_inv_val, 0.0f}; // [0,0]
+    mat.mu_inv_eff.val[4] = {mu_inv_val, 0.0f}; // [1,1]
+    mat.mu_inv_eff.val[8] = {mu_inv_val, 0.0f}; // [2,2]
+
+    [cite_start]// Set TTI conductivity [cite: 68, 69]
+    float sig_h = static_cast<float>(1.0 / bg_rho);
+    float sig_v = sig_h * 0.5f; // Vertical resistivity is higher (conductance is lower)
+
+    mat.sigma_eff.val[0] = {sig_h, 0.0f}; // sig_xx
+    mat.sigma_eff.val[4] = {sig_h, 0.0f}; // sig_yy
+    mat.sigma_eff.val[8] = {sig_v, 0.0f}; // sig_zz
+
+    return mat;
+}
+MaterialProperty Physics::compute_cell_material_(
     int i, int j, int k, 
     const GridInfo& grid, 
     int n_pml, 
@@ -114,8 +140,10 @@ MaterialProperty Physics::compute_cell_material(
         mat.sigma_eff.val[d*3 + d] = { orig.real() + pml_term.real(), orig.imag() };
     }
 
-    float mu_inv_val = 1.0f / (4.0f * (float)M_PI * 1.0e-7f);
-    mat.mu_inv_eff.set_isotropic({mu_inv_val, 0.0f});
+    //float mu_inv_val = 1.0f / (4.0f * (float)M_PI * 1.0e-7f);
+    //mat.sigma_eff.set_isotropic({mu_inv_val, 0.0f});
+    float mu_phys = 4.0f * (float)M_PI * 1.0e-7f;
+    mat.mu_inv_eff.set_isotropic({1.0f / mu_phys, 0.0f}); // Set mu_inv, not sigma_eff! [cite: 55, 141]
 
     return mat;
 }
