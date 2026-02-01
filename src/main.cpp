@@ -64,11 +64,47 @@ void apply_source_generic(
     if (src.type == "magnetic_dipole") {
         double mz = src.direction[2];
         if (std::abs(mz) > 1e-12) {
-            long long idx_ex = (long long)0 * grid.nx * grid.ny * grid.nz + iz * grid.nx * grid.ny + iy * grid.nx + ix;
-            long long idx_ey = (long long)1 * grid.nx * grid.ny * grid.nz + iz * grid.nx * grid.ny + iy * grid.nx + ix;
+            // Distribute dipole source over 8 neighboring cells (short-support kernel)
+            // Determine neighbor cell indices (prefer ix and ix-1, but stay inside domain)
+            int ix0 = ix;
+            int ix1 = (ix > 0) ? ix-1 : std::min(ix+1, grid.nx-1);
+            int iy0 = iy;
+            int iy1 = (iy > 0) ? iy-1 : std::min(iy+1, grid.ny-1);
+            int iz0 = iz;
+            int iz1 = (iz > 0) ? iz-1 : std::min(iz+1, grid.nz-1);
 
-            if (idx_ex < (long long)rhs.size()) rhs[idx_ex].x += (float)(src.amplitude * mz);
-            if (idx_ey < (long long)rhs.size()) rhs[idx_ey].x -= (float)(src.amplitude * mz);
+            // uniform split among 8 neighbors
+            double Js_mag = src.amplitude * mz;
+            const int Nparts = 8;
+            double Js_part = Js_mag / (double)Nparts;
+
+            for (int dz_off = 0; dz_off <= 1; ++dz_off) {
+                for (int dy_off = 0; dy_off <= 1; ++dy_off) {
+                    for (int dx_off = 0; dx_off <= 1; ++dx_off) {
+                        int ci = dx_off ? ix1 : ix0;
+                        int cj = dy_off ? iy1 : iy0;
+                        int ck = dz_off ? iz1 : iz0;
+                        if (ci < 0 || cj < 0 || ck < 0) continue;
+                        if (ci >= grid.nx || cj >= grid.ny || ck >= grid.nz) continue;
+
+                        long long idx_ex = (long long)0 * grid.nx * grid.ny * grid.nz + ck * grid.nx * grid.ny + cj * grid.nx + ci;
+                        long long idx_ey = (long long)1 * grid.nx * grid.ny * grid.nz + ck * grid.nx * grid.ny + cj * grid.nx + ci;
+                        long long idx_ez = (long long)2 * grid.nx * grid.ny * grid.nz + ck * grid.nx * grid.ny + cj * grid.nx + ci;
+
+                        double dx_loc = grid.dx(ci);
+                        double dy_loc = grid.dy(cj);
+                        double dz_loc = grid.dz(ck);
+                        double cell_vol = dx_loc * dy_loc * dz_loc;
+
+                        double rhs_im = omega * Js_part / std::max(cell_vol, 1e-18);
+
+                        if (idx_ex >= 0 && idx_ex < (long long)rhs.size()) rhs[idx_ex].y += (float)(rhs_im);
+                        if (idx_ey >= 0 && idx_ey < (long long)rhs.size()) rhs[idx_ey].y -= (float)(rhs_im);
+                        // Ez may be unused for this dipole orientation but keep zero change
+                        (void)idx_ez;
+                    }
+                }
+            }
         }
     }
 }
@@ -147,6 +183,38 @@ int main(int argc, char* argv[]) {
     // Apply source
     std::cout << "Applying source..." << std::endl;
     apply_source_generic(cfg.source, grid, rhs, omega);
+
+    // If analytical validation is enabled, project analytic field onto DOFs
+    // by computing b = A * x_analytical (exact discrete RHS = i*w*J_s)
+    if (cfg.validation.enabled && cfg.validation.mode == "analytical") {
+        std::cout << "Applying analytic->DOF projection: building RHS = A * E_analytical" << std::endl;
+        auto x_analytical_proj = AnalyticalSolution::compute_field(
+            1.0 / cfg.model.bg_rho, cfg.source.frequency, grid,
+            (double)find_nearest_node(grid.x_nodes, cfg.source.position[0]),
+            (double)find_nearest_node(grid.y_nodes, cfg.source.position[1]),
+            (double)find_nearest_node(grid.z_nodes, cfg.source.position[2]),
+            cfg.source.direction[0], cfg.source.direction[1], cfg.source.direction[2]
+        );
+
+        // Compute b = A * x_analytical_proj and overwrite rhs
+        std::vector<cuComplexType> b_proj((size_t)A.num_rows, make_cuComplex(0.0f, 0.0f));
+        for (int r = 0; r < A.num_rows; ++r) {
+            int start = A.row_ptr[r];
+            int end = A.row_ptr[r+1];
+            float acc_r = 0.0f, acc_i = 0.0f;
+            for (int p = start; p < end; ++p) {
+                int c = A.col_ind[p];
+                cuComplexType a = A.val[p];
+                cuComplexType xb = x_analytical_proj[c];
+                float ar = a.x, ai = a.y;
+                float br = xb.x, bi = xb.y;
+                acc_r += ar * br - ai * bi;
+                acc_i += ar * bi + ai * br;
+            }
+            b_proj[r] = make_cuComplex(acc_r, acc_i);
+        }
+        rhs = std::move(b_proj);
+    }
     
     std::cout << "\n=== Diagnostic: RHS magnitudes ===" << std::endl;
     float max_rhs = 0.0f;
@@ -161,10 +229,40 @@ int main(int argc, char* argv[]) {
     std::cout << "Max RHS magnitude: " << max_rhs << " at index " << max_idx << std::endl;
     std::cout << "RHS size: " << rhs.size() << std::endl;
     
-    // Print first few RHS values
-    std::cout << "\nFirst 5 RHS values:" << std::endl;
-    for (int i = 0; i < std::min(5, (int)rhs.size()); ++i) {
-        std::cout << "  rhs[" << i << "] = " << rhs[i].x << " + i" << rhs[i].y << std::endl;
+    // Debug: print RHS values at the 8 source support DOFs (Ex, Ey, Ez)
+    std::cout << "\nRHS at source support DOFs:" << std::endl;
+    std::vector<std::pair<std::string,long long>> src_dofs;
+    {
+        int ix = find_nearest_node(grid.x_nodes, cfg.source.position[0]);
+        int iy = find_nearest_node(grid.y_nodes, cfg.source.position[1]);
+        int iz = find_nearest_node(grid.z_nodes, cfg.source.position[2]);
+        int ix0 = ix;
+        int ix1 = (ix > 0) ? ix-1 : std::min(ix+1, grid.nx-1);
+        int iy0 = iy;
+        int iy1 = (iy > 0) ? iy-1 : std::min(iy+1, grid.ny-1);
+        int iz0 = iz;
+        int iz1 = (iz > 0) ? iz-1 : std::min(iz+1, grid.nz-1);
+        for (int dz_off = 0; dz_off <= 1; ++dz_off) {
+            for (int dy_off = 0; dy_off <= 1; ++dy_off) {
+                for (int dx_off = 0; dx_off <= 1; ++dx_off) {
+                    int ci = dx_off ? ix1 : ix0;
+                    int cj = dy_off ? iy1 : iy0;
+                    int ck = dz_off ? iz1 : iz0;
+                    long long idx_ex = (long long)0 * grid.nx * grid.ny * grid.nz + ck * grid.nx * grid.ny + cj * grid.nx + ci;
+                    long long idx_ey = (long long)1 * grid.nx * grid.ny * grid.nz + ck * grid.nx * grid.ny + cj * grid.nx + ci;
+                    long long idx_ez = (long long)2 * grid.nx * grid.ny * grid.nz + ck * grid.nx * grid.ny + cj * grid.nx + ci;
+                    src_dofs.push_back({"Ex", idx_ex});
+                    src_dofs.push_back({"Ey", idx_ey});
+                    src_dofs.push_back({"Ez", idx_ez});
+                }
+            }
+        }
+    }
+    for (auto &p : src_dofs) {
+        long long id = p.second;
+        if (id >= 0 && id < (long long)rhs.size()) {
+            std::cout << "  " << p.first << "[" << id << "] = " << rhs[id].x << " + i" << rhs[id].y << std::endl;
+        }
     }
 
     // --- Debug: inspect assembled matrix near source DOFs (sample triplets + diagonal) ---
@@ -260,40 +358,106 @@ int main(int argc, char* argv[]) {
         std::string analytical_name = cfg.receiver.output_file + "_analytical.vtr";
         VtkExporter::save_to_vtr(analytical_name, grid, x_analytical);
         std::cout << "Exported analytical to " << analytical_name << std::endl;
-        
-        std::cout << "\n=== Field Comparison: Numerical vs Analytical ===" << std::endl;
-        
-        int i_near = ix_src + 1, j_near = iy_src, k_near = iz_src;
-        for (int comp = 0; comp < 3; ++comp) {
-            long long idx_num = (long long)comp * grid.nx * grid.ny * grid.nz 
-                              + k_near * grid.nx * grid.ny + j_near * grid.nx + i_near;
-            long long idx_ana = (long long)comp * grid.nx * grid.ny * grid.nz 
-                              + k_near * grid.nx * grid.ny + j_near * grid.nx + i_near;
-            
-            float mag_num = std::sqrt(x[idx_num].x * x[idx_num].x + x[idx_num].y * x[idx_num].y);
-            float mag_ana = std::sqrt(x_analytical[idx_ana].x * x_analytical[idx_ana].x 
-                                    + x_analytical[idx_ana].y * x_analytical[idx_ana].y);
-            
-            std::cout << "Comp " << comp << " near field: num=" << mag_num << ", ana=" << mag_ana 
-                      << ", ratio=" << (mag_ana > 1e-15 ? mag_num/mag_ana : 0) << std::endl;
-        }
-        
-        int i_far = ix_src + 20, j_far = iy_src, k_far = iz_src;
-        if (i_far < grid.nx) {
-            for (int comp = 0; comp < 3; ++comp) {
-                long long idx_num = (long long)comp * grid.nx * grid.ny * grid.nz 
-                                  + k_far * grid.nx * grid.ny + j_far * grid.nx + i_far;
-                long long idx_ana = (long long)comp * grid.nx * grid.ny * grid.nz 
-                                  + k_far * grid.nx * grid.ny + j_far * grid.nx + i_far;
-                
-                float mag_num = std::sqrt(x[idx_num].x * x[idx_num].x + x[idx_num].y * x[idx_num].y);
-                float mag_ana = std::sqrt(x_analytical[idx_ana].x * x_analytical[idx_ana].x 
-                                        + x_analytical[idx_ana].y * x_analytical[idx_ana].y);
-                
-                std::cout << "Comp " << comp << " far field: num=" << mag_num << ", ana=" << mag_ana 
-                          << ", ratio=" << (mag_ana > 1e-15 ? mag_num/mag_ana : 0) << std::endl;
+        // --- Verification: build RHS = A * x_analytical and solve to recover x_analytical ---
+        std::cout << "\nBuilding RHS = A * x_analytical for verification..." << std::endl;
+        std::vector<cuComplexType> b_check((size_t)A.num_rows, make_cuComplex(0.0f, 0.0f));
+        for (int r = 0; r < A.num_rows; ++r) {
+            int start = A.row_ptr[r];
+            int end = A.row_ptr[r+1];
+            float acc_r = 0.0f, acc_i = 0.0f;
+            for (int p = start; p < end; ++p) {
+                int c = A.col_ind[p];
+                cuComplexType a = A.val[p];
+                cuComplexType xb = x_analytical[c];
+                float ar = a.x, ai = a.y;
+                float br = xb.x, bi = xb.y;
+                acc_r += ar * br - ai * bi;
+                acc_i += ar * bi + ai * br;
             }
+            b_check[r] = make_cuComplex(acc_r, acc_i);
         }
+
+        std::cout << "Solving verification system..." << std::endl;
+        std::vector<cuComplexType> x_check(b_check.size(), make_cuComplex(0.0f, 0.0f));
+        Solver verifier;
+        verifier.solve(A, b_check, x_check);
+
+        // compute max abs error between x_check and x_analytical
+        double max_err = 0.0;
+        for (int i = 0; i < (int)x_check.size(); ++i) {
+            double dr = x_check[i].x - x_analytical[i].x;
+            double di = x_check[i].y - x_analytical[i].y;
+            double err = std::sqrt(dr*dr + di*di);
+            if (err > max_err) max_err = err;
+        }
+        std::cout << "Verification solve max abs error: " << max_err << std::endl;
+
+        std::cout << "\n=== Field Comparison: Numerical vs Analytical (line scans) ===" << std::endl;
+        int n_pml = cfg.model.pml_layers;
+        int ixc = ix_src, iyc = iy_src, izc = iz_src;
+
+        auto print_scan = [&](char axis) {
+            std::cout << "\nScan along " << axis << ": index, E0_num, E0_ana, E1_num, E1_ana, E2_num, E2_ana" << std::endl;
+            std::vector<int> coords;
+            if (axis == 'x') {
+                int i_end = grid.nx - n_pml - 1;
+                int N = std::max(2, i_end - ixc + 1);
+                int steps = std::min(20, N);
+                for (int s = 0; s < steps; ++s) coords.push_back(ixc + (int)((double)s * (i_end - ixc) / std::max(1, steps-1)));
+                for (int i : coords) {
+                    long long base = (long long)izc * grid.nx * grid.ny + (long long)iyc * grid.nx + i;
+                    std::cout << "i=" << i << ", ";
+                    for (int comp = 0; comp < 3; ++comp) {
+                        long long idx_num = (long long)comp * grid.nx * grid.ny * grid.nz + base;
+                        long long idx_ana = idx_num;
+                        float mag_num = 0.0f, mag_ana = 0.0f;
+                        if (idx_num >= 0 && idx_num < (long long)x.size()) mag_num = std::sqrt(x[idx_num].x * x[idx_num].x + x[idx_num].y * x[idx_num].y);
+                        if (idx_ana >= 0 && idx_ana < (long long)x_analytical.size()) mag_ana = std::sqrt(x_analytical[idx_ana].x * x_analytical[idx_ana].x + x_analytical[idx_ana].y * x_analytical[idx_ana].y);
+                        std::cout << "E" << comp << "_num=" << mag_num << ", E" << comp << "_ana=" << mag_ana << "; ";
+                    }
+                    std::cout << std::endl;
+                }
+            } else if (axis == 'y') {
+                int j_end = grid.ny - n_pml - 1;
+                int N = std::max(2, j_end - iyc + 1);
+                int steps = std::min(20, N);
+                for (int s = 0; s < steps; ++s) coords.push_back(iyc + (int)((double)s * (j_end - iyc) / std::max(1, steps-1)));
+                for (int j : coords) {
+                    long long base = (long long)izc * grid.nx * grid.ny + (long long)j * grid.nx + ixc;
+                    std::cout << "j=" << j << ", ";
+                    for (int comp = 0; comp < 3; ++comp) {
+                        long long idx_num = (long long)comp * grid.nx * grid.ny * grid.nz + base;
+                        long long idx_ana = idx_num;
+                        float mag_num = 0.0f, mag_ana = 0.0f;
+                        if (idx_num >= 0 && idx_num < (long long)x.size()) mag_num = std::sqrt(x[idx_num].x * x[idx_num].x + x[idx_num].y * x[idx_num].y);
+                        if (idx_ana >= 0 && idx_ana < (long long)x_analytical.size()) mag_ana = std::sqrt(x_analytical[idx_ana].x * x_analytical[idx_ana].x + x_analytical[idx_ana].y * x_analytical[idx_ana].y);
+                        std::cout << "E" << comp << "_num=" << mag_num << ", E" << comp << "_ana=" << mag_ana << "; ";
+                    }
+                    std::cout << std::endl;
+                }
+            } else if (axis == 'z') {
+                int k_end = grid.nz - n_pml - 1;
+                int N = std::max(2, k_end - izc + 1);
+                int steps = std::min(20, N);
+                for (int s = 0; s < steps; ++s) coords.push_back(izc + (int)((double)s * (k_end - izc) / std::max(1, steps-1)));
+                for (int k : coords) {
+                    long long base = (long long)k * grid.nx * grid.ny + (long long)iyc * grid.nx + ixc;
+                    std::cout << "k=" << k << ", ";
+                    for (int comp = 0; comp < 3; ++comp) {
+                        long long idx_num = (long long)comp * grid.nx * grid.ny * grid.nz + base;
+                        long long idx_ana = idx_num;
+                        float mag_num = 0.0f, mag_ana = 0.0f;
+                        if (idx_num >= 0 && idx_num < (long long)x.size()) mag_num = std::sqrt(x[idx_num].x * x[idx_num].x + x[idx_num].y * x[idx_num].y);
+                        if (idx_ana >= 0 && idx_ana < (long long)x_analytical.size()) mag_ana = std::sqrt(x_analytical[idx_ana].x * x_analytical[idx_ana].x + x_analytical[idx_ana].y * x_analytical[idx_ana].y);
+                        std::cout << "E" << comp << "_num=" << mag_num << ", E" << comp << "_ana=" << mag_ana << "; ";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+        };
+        print_scan('x');
+        print_scan('y');
+        print_scan('z');
     }
     
     return 0;
