@@ -13,6 +13,8 @@ using cuComplexType = cuComplex;
 using Real = float;
 using Complex = std::complex<float>;
 
+#define IDX(i, j, k, comp) (long long)((comp) * grid.nx * grid.ny * grid.nz + (k) * grid.nx * grid.ny + (j) * grid.nx + (i))
+
 // 稀疏矩阵的三元组
 struct Triplet {
     int row;

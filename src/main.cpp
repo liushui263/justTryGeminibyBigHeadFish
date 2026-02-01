@@ -48,7 +48,8 @@ int find_nearest_node(const std::vector<double>& nodes, double val) {
 void apply_source_generic(
     const SourceConfig& src,
     const GridInfo& grid,
-    std::vector<cuComplexType>& rhs
+    std::vector<cuComplexType>& rhs,
+    double omega
 ) {
     std::cout << "\n=== apply_source_generic called ===\n";
     std::cout << "Source type: " << src.type << "\n";
@@ -65,6 +66,7 @@ void apply_source_generic(
         if (std::abs(mz) > 1e-12) {
             long long idx_ex = (long long)0 * grid.nx * grid.ny * grid.nz + iz * grid.nx * grid.ny + iy * grid.nx + ix;
             long long idx_ey = (long long)1 * grid.nx * grid.ny * grid.nz + iz * grid.nx * grid.ny + iy * grid.nx + ix;
+
             if (idx_ex < (long long)rhs.size()) rhs[idx_ex].x += (float)(src.amplitude * mz);
             if (idx_ey < (long long)rhs.size()) rhs[idx_ey].x -= (float)(src.amplitude * mz);
         }
@@ -144,7 +146,7 @@ int main(int argc, char* argv[]) {
     
     // Apply source
     std::cout << "Applying source..." << std::endl;
-    apply_source_generic(cfg.source, grid, rhs);
+    apply_source_generic(cfg.source, grid, rhs, omega);
     
     std::cout << "\n=== Diagnostic: RHS magnitudes ===" << std::endl;
     float max_rhs = 0.0f;
@@ -164,6 +166,40 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < std::min(5, (int)rhs.size()); ++i) {
         std::cout << "  rhs[" << i << "] = " << rhs[i].x << " + i" << rhs[i].y << std::endl;
     }
+
+    // --- Debug: inspect assembled matrix near source DOFs (sample triplets + diagonal) ---
+    int ix_src_dbg = find_nearest_node(grid.x_nodes, cfg.source.position[0]);
+    int iy_src_dbg = find_nearest_node(grid.y_nodes, cfg.source.position[1]);
+    int iz_src_dbg = find_nearest_node(grid.z_nodes, cfg.source.position[2]);
+    long long base_dbg = (long long)iz_src_dbg * grid.nx * grid.ny + (long long)iy_src_dbg * grid.nx + ix_src_dbg;
+
+    std::cout << "\n--- CSR debug: sample entries near source grid index (" << ix_src_dbg << "," << iy_src_dbg << "," << iz_src_dbg << ") ---" << std::endl;
+    for (int comp = 0; comp < 3; ++comp) {
+        long long row = (long long)comp * grid.nx * grid.ny * grid.nz + base_dbg;
+        if (row < 0 || row >= (long long)A.num_rows) {
+            std::cout << "Row " << row << " out of range" << std::endl;
+            continue;
+        }
+        std::cout << "Component " << comp << " row=" << row << ":\n";
+        int start = A.row_ptr[row];
+        int end = A.row_ptr[row+1];
+        int to_print = std::min(8, end - start);
+        for (int p = start; p < start + to_print; ++p) {
+            int col = A.col_ind[p];
+            cuComplexType v = A.val[p];
+            std::cout << "  col=" << col << " val=" << v.x << " + i" << v.y << std::endl;
+        }
+        // find diagonal
+        double diag_mag = 0.0;
+        for (int p = start; p < end; ++p) {
+            if (A.col_ind[p] == row) {
+                cuComplexType vd = A.val[p];
+                diag_mag = std::sqrt((double)vd.x * vd.x + (double)vd.y * vd.y);
+                break;
+            }
+        }
+        std::cout << "  diagonal magnitude = " << diag_mag << std::endl;
+    }
     
     // Frequency check
     std::cout << "\nFrequency: " << cfg.source.frequency << " Hz" << std::endl;
@@ -173,25 +209,6 @@ int main(int argc, char* argv[]) {
     Solver solver;
     std::vector<cuComplexType> x(rhs.size(), make_cuComplex(0.0f, 0.0f));
     
-    // --- Debug: Source Location RHS Inspection ---
-    int nx = grid.nx, ny = grid.ny, nz = grid.nz;
-    int sx =grid.nx/2, sy = grid.ny/2, sz = grid.nz/2; // Your source grid index from logs
-    
-    std::cout << "\n=== Source Location RHS Debug (Index: " << sx << ", " << sy << ", " << sz << ") ===" << std::endl;
-    for (int comp = 0; comp < 3; ++comp) {
-        long long center_idx = (long long)comp * nx * ny * nz + (long long)sz * nx * ny + (long long)sy * nx + sx;
-        
-        // Convert cuComplex to a printable format
-        auto val = rhs[center_idx];
-        std::cout << "Comp " << comp << " at source: " << val.x << " + i" << val.y << std::endl;
-        
-        // Check one neighbor in X to see if it's a "point" or "distributed" source
-        long long neighbor_idx = center_idx + 1;
-        auto n_val = rhs[neighbor_idx];
-        std::cout << "  Neighbor (X+1): " << n_val.x << " + i" << n_val.y << std::endl;
-    }
-    std::cout << "==========================================\n" << std::endl;
-
     std::cout << "Solving..." << std::endl;
     auto t_solve_start = std::chrono::high_resolution_clock::now();
     
@@ -236,7 +253,7 @@ int main(int argc, char* argv[]) {
     
     if (cfg.validation.enabled && cfg.validation.mode == "analytical") {
         auto x_analytical = AnalyticalSolution::compute_field(
-            cfg.model.bg_rho, cfg.source.frequency, grid,
+            1.0 / cfg.model.bg_rho, cfg.source.frequency, grid,
             (double)ix_src, (double)iy_src, (double)iz_src,
             cfg.source.direction[0], cfg.source.direction[1], cfg.source.direction[2]
         );
